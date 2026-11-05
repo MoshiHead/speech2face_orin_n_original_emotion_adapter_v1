@@ -45,7 +45,7 @@ def main():
     mimi_weight = weights / "mimi.safetensors"
     tokenizer = weights / "tokenizer_spm_32k_3.model"
     for f in (moshi_weight, mimi_weight, tokenizer):
-        assert f.exists(), "missing %s - finish runpod_speech2face.ipynb first" % f
+        assert f.exists(), "missing %s - run the Section 0 setup cells (or prepare_x86.sh) first" % f
 
     import torch
 
@@ -92,8 +92,19 @@ def main():
     FRAME = int(mimi.sample_rate / mimi.frame_rate)     # 1920 samples = 80 ms
     device = engine.device
 
+    # Full-clip bulk encodes hit the encoder transformer with lengths its CUDA
+    # graph was never captured for (CUDAGraphed is shape-static) - bypass it,
+    # exactly like the live server's raw voice prompt path. Re-applied after
+    # every streaming reset in case the state (and its graph) is re-created.
+    def _disable_mimi_enc_graph():
+        st = getattr(mimi, "_streaming_state", None)
+        g = getattr(st, "graphed_tr_enc", None)
+        if g is not None:
+            g.disable = True
+
     # one fixed silence code column for the USER stream (encoded once, reused)
     mimi.reset_streaming()
+    _disable_mimi_enc_graph()
     with torch.no_grad():
         silence = mimi.encode(torch.zeros(1, 1, FRAME, device=device))[:, :8].clone()
 
@@ -141,6 +152,7 @@ def main():
             continue
         wav = torch.from_numpy(wav_np[: n_steps * FRAME].copy()).view(1, 1, -1).to(device)
         mimi.reset_streaming()
+        _disable_mimi_enc_graph()
         with torch.no_grad():
             codes = mimi.encode(wav)[:, :8]             # [1,8,T] agent-stream codes
         if (args.reset_mode == "clip"

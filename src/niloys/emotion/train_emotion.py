@@ -32,6 +32,20 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--val_split", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=1234)
+    # periodic test videos (the old pipeline's every-10-epochs test, adapted to
+    # the new architecture: the ref image is baked into the distilled renderer,
+    # and the audio features are the PRE-EXTRACTED helium of a fixed clip - the
+    # 7B trunk never runs inside the training process)
+    ap.add_argument("--test_every_n_epochs", type=int, default=10, help="0 = off")
+    ap.add_argument("--test_helium", default="",
+                    help="pre-extracted helium .pt for the test clip")
+    ap.add_argument("--test_wav", default="", help="audio muxed into the test videos")
+    ap.add_argument("--test_out_dir", default="")
+    ap.add_argument("--test_emotion_id", type=int, default=-1,
+                    help="-1 = cycle all six emotions across tests")
+    ap.add_argument("--test_gain", type=float, default=1.2)
+    ap.add_argument("--test_seconds", type=float, default=6.0)
+    ap.add_argument("--motion_map", default="affine", choices=["affine", "clamp", "none"])
     args = ap.parse_args()
 
     repo = Path(args.repo_root).resolve()
@@ -192,8 +206,10 @@ def main():
             model.set_emotion(e)
             outs = []
             for t in range(T):
-                outs.append(model.step(h[t + L: t + L + 1].to(device), st)[0, 0])
-            pred = torch.stack(outs, 0).float().cpu()               # [2T,32] norm
+                # step() -> [1,2,32]: BOTH motion frames of the 80 ms step (the
+                # state's prev_motion auto-feeds the free-running rollout)
+                outs.append(model.step(h[t + L: t + L + 1].to(device), st)[0])
+            pred = torch.cat(outs, 0).float().cpu()                 # [2T,32] norm
             tgt = (m[: 2 * T] - mot_mean) / mot_std
             out[EMOTION_NAMES[e]] = float(
                 ((pred - tgt) ** 2).mean() / (tgt ** 2).mean().clamp_min(1e-8))
@@ -203,12 +219,57 @@ def main():
     @torch.no_grad()
     def emotion_vectors():
         model.eval()
-        b = torch.cat([model.emotion_conditioner.bias_for(e, device, torch.float32)[0, 0]
-                       for e in range(NUM_EMOTIONS)], 0)
+        # stack (not cat): each bias_for(...)[0, 0] is [d_model]; we want [NUM_EMOTIONS, d_model]
+        b = torch.stack([model.emotion_conditioner.bias_for(e, device, torch.float32)[0, 0]
+                         for e in range(NUM_EMOTIONS)], 0)
         model.train()
         norms = b.norm(dim=-1)
         cos = F.cosine_similarity(b[None, :, :], b[:, None, :], dim=-1)
         return norms, cos
+
+    # ---------------- periodic test videos ----------------
+    # Adapted from the old FM pipeline's EpochTestVideoCallback (every 10 epochs,
+    # ref image + audio + emotion -> video). New-architecture translation:
+    #   * ref image   -> the distilled renderer's baked-in identity (no ref needed)
+    #   * audio feats -> the PRE-EXTRACTED helium of a fixed test clip (the 7B
+    #                    trunk never runs inside the training process)
+    #   * Lightning epoch callback -> an epoch boundary in this step-based loop
+    # Rendering is no_grad + eval/train bracketed and reuses one lazily-loaded
+    # renderer; it cannot touch the optimizer or the emotion bias
+    # (forward_with_emotion saves/restores it; set_emotion writes the live buffer).
+    steps_per_epoch = max(1, -(-len(train_ds) // args.batch_size))
+    test_every = (args.test_every_n_epochs * steps_per_epoch
+                  if (args.test_every_n_epochs > 0 and args.test_helium) else 0)
+    test_state = {"R": None, "h": None, "n": 0}
+    if test_every > 0:
+        import render_emotion_tests as ret
+        hpack = torch.load(args.test_helium, map_location="cpu", weights_only=False)
+        test_state["h"] = (hpack["helium"] if isinstance(hpack, dict) else hpack).float()
+        print("[test] periodic test videos: every %d epochs (%d steps), %.0f s clip -> %s"
+              % (args.test_every_n_epochs, test_every, args.test_seconds,
+                 args.test_out_dir), flush=True)
+
+    @torch.no_grad()
+    def run_test_video(epoch):
+        if test_state["h"] is None:
+            return
+        if test_state["R"] is None:
+            test_state["R"], _rp = ret.load_renderer(args.repo_root, device)
+        eid = (test_state["n"] % NUM_EMOTIONS
+               if args.test_emotion_id < 0 else args.test_emotion_id)
+        os.makedirs(args.test_out_dir, exist_ok=True)
+        out = os.path.join(args.test_out_dir, "epoch_%04d_%s.mp4"
+                           % (epoch, EMOTION_NAMES[eid]))
+        model.eval()
+        ret.render_motion_video(model, test_state["R"], test_state["h"], cfg, eid,
+                                args.test_wav or None, out, device,
+                                gain=args.test_gain, max_seconds=args.test_seconds,
+                                motion_map=args.motion_map)
+        model.train()
+        test_state["n"] += 1
+        print("[test] epoch %d -> %s" % (epoch, out), flush=True)
+
+    run_test_video(0)   # baseline: the untrained adapter on the test clip
 
     # ---------------- loop ----------------
     os.makedirs(args.out_dir, exist_ok=True)
@@ -237,6 +298,8 @@ def main():
             print("[train] step %6d/%d  loss %.5f  ema %.5f  |g| %.3f  %.1f it/s"
                   % (step, args.max_steps, loss.item(), ema, float(gn),
                      step / (time.time() - t0)), flush=True)
+        if test_every > 0 and (step % test_every == 0 or step == args.max_steps):
+            run_test_video(step // steps_per_epoch)
         if step % args.val_every == 0 or step == args.max_steps:
             mse = evaluate()
             nmse = rollout_nmse()
