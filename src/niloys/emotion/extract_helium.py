@@ -19,8 +19,12 @@ AUDIO_EXTS = ("wav", "mp3", "flac", "ogg", "m4a")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo_root", required=True)
-    ap.add_argument("--motion_dir", required=True)
-    ap.add_argument("--raw_audio_dir", required=True)
+    ap.add_argument("--single_wav", default="",
+                    help="extract ONE wav (the fixed test clip): skips the "
+                         "motion/emotion-label requirements and writes "
+                         "<out_dir>/<stem>.pt, then exits")
+    ap.add_argument("--motion_dir", default="")
+    ap.add_argument("--raw_audio_dir", default="")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--voice", default="Robert_5.pt")
     ap.add_argument("--text_prompt", required=True)
@@ -107,6 +111,38 @@ def main():
     _disable_mimi_enc_graph()
     with torch.no_grad():
         silence = mimi.encode(torch.zeros(1, 1, FRAME, device=device))[:, :8].clone()
+
+    if args.single_wav:
+        # single-file mode for the fixed test clip: no motion .pt, no emotion
+        # label needed (the test rollouts set the emotion explicitly)
+        os.makedirs(args.out_dir, exist_ok=True)
+        stem = Path(args.single_wav).stem
+        out_path = os.path.join(args.out_dir, stem + ".pt")
+        if not os.path.exists(out_path):
+            wav_np = load_audio_24k(args.single_wav)
+            n_steps = int(len(wav_np)) // FRAME
+            assert n_steps >= 4, "test audio too short: %s" % args.single_wav
+            wav = torch.from_numpy(wav_np[: n_steps * FRAME].copy()).view(1, 1, -1).to(device)
+            mimi.reset_streaming()
+            _disable_mimi_enc_graph()
+            with torch.no_grad():
+                codes = mimi.encode(wav)[:, :8]
+            engine.reset_session()
+            hidden = []
+            with torch.no_grad():
+                for t in range(n_steps):
+                    out = engine.lm_gen._step(input_tokens=silence,
+                                              moshi_tokens=codes[:, :, t:t + 1])
+                    if out is None:
+                        continue
+                    hidden.append(out[2][:1, -1:].detach().float().cpu())
+            h = torch.cat(hidden, 1)[0].contiguous()        # [T,4096]
+            torch.save({"helium": h, "emotion_id": -1, "stem": stem}, out_path)
+        h = torch.load(out_path, map_location="cpu", weights_only=False)["helium"]
+        print("EXTRACTION DONE: test clip %s -> %s (%d steps, %.1f s)"
+              % (stem, out_path, h.shape[0], h.shape[0] / 12.5), flush=True)
+        return
+
 
     # ---- clip list: motion stems that also have raw audio + an emotion label
     motion_files = sorted(glob.glob(os.path.join(args.motion_dir, "*.pt")))

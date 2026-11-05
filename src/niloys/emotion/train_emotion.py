@@ -46,6 +46,13 @@ def main():
     ap.add_argument("--test_gain", type=float, default=1.2)
     ap.add_argument("--test_seconds", type=float, default=6.0)
     ap.add_argument("--motion_map", default="affine", choices=["affine", "clamp", "none"])
+    ap.add_argument("--test_renderer", default="imt", choices=["imt", "distilled"],
+                    help="imt = the vendored reference-image-conditioned IMTalker "
+                         "renderer (the old pipeline's testing path); distilled = "
+                         "the live server's single-identity renderer")
+    ap.add_argument("--imt_ckpt", default="", help="old IMTalker renderer.ckpt")
+    ap.add_argument("--ref_image", default="",
+                    help="reference face image for the IMT renderer")
     args = ap.parse_args()
 
     repo = Path(args.repo_root).resolve()
@@ -238,8 +245,15 @@ def main():
     # renderer; it cannot touch the optimizer or the emotion bias
     # (forward_with_emotion saves/restores it; set_emotion writes the live buffer).
     steps_per_epoch = max(1, -(-len(train_ds) // args.batch_size))
+    test_ok = bool(args.test_helium)
+    if args.test_renderer == "imt" and not (
+            args.imt_ckpt and os.path.exists(args.imt_ckpt)
+            and args.ref_image and os.path.exists(args.ref_image)):
+        print("[test] WARNING: IMT prerequisites missing (imt_ckpt/ref_image) - "
+              "periodic test videos disabled", flush=True)
+        test_ok = False
     test_every = (args.test_every_n_epochs * steps_per_epoch
-                  if (args.test_every_n_epochs > 0 and args.test_helium) else 0)
+                  if (args.test_every_n_epochs > 0 and test_ok) else 0)
     test_state = {"R": None, "h": None, "n": 0}
     if test_every > 0:
         import render_emotion_tests as ret
@@ -254,7 +268,11 @@ def main():
         if test_state["h"] is None:
             return
         if test_state["R"] is None:
-            test_state["R"], _rp = ret.load_renderer(args.repo_root, device)
+            if args.test_renderer == "imt":
+                test_state["R"] = ret.load_imt_renderer(args.imt_ckpt,
+                                                        args.ref_image, device)
+            else:
+                test_state["R"], _rp = ret.load_renderer(args.repo_root, device)
         eid = (test_state["n"] % NUM_EMOTIONS
                if args.test_emotion_id < 0 else args.test_emotion_id)
         os.makedirs(args.test_out_dir, exist_ok=True)
